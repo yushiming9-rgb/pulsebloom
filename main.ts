@@ -21,6 +21,8 @@ const ENTRY_NAME = 'Pulsebloom — a beat-driven arena survival shooter';
 const here = fileURLToPath(new URL('.', import.meta.url));
 const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
+// The dossier is rebuilt from whatever is on disk, so a re-run after a code change always
+// hands in the current build rather than a stale copy.
 console.log(`handing in entry: ${ENTRY_NAME}`);
 mkdirSync(out, { recursive: true });
 cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
