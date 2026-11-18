@@ -1,351 +1,272 @@
-// The world: the whole simulation in one step() function — player physics, shooting, dashes,
-// enemy brains, bullets, particles, the beat clock, the wave director and scoring. Rendering
-// reads it; the screenshot autopilot steers it; the browser loop and the scenes both feed it.
+// The whole simulation in one pure-ish module: a run's state machine, the player,
+// enemies, bullets and particles, all stepped at a fixed 60 Hz.
+import { ARENA_RADIUS, ARENA_CENTER, PLAYER, BEAT, SCORING } from './config.js';
+import { wavePlan, bpmForWave, enemySpec } from './waves.js';
+import { rollOffers, boonByKey } from './upgrades.js';
 
-import { BULLET, COMBO, ENEMIES, FIELD, PLAYER, PALETTE, SCORE_PER_BEAT_DASH, STEP, WAVES } from './config.js';
-import { createRandom, rangeBetween } from './random.js';
-import { rollOffers } from './upgrades.js';
-import { planWave } from './waves.js';
+export const STATE = { TITLE: 'title', PLAYING: 'playing', UPGRADE: 'upgrade', PAUSED: 'paused', GAME_OVER: 'game_over', VICTORY: 'victory' };
 
-export const SCREEN_TITLE = 'title';
-export const SCREEN_PLAY = 'play';
-export const SCREEN_UPGRADE = 'upgrade';
-export const SCREEN_OVER = 'over';
-export const SCREEN_WIN = 'win';
-export const SCREEN_PAUSE = 'pause';
-
-export const EVENT_OVER = 1;
-export const EVENT_WIN = 2;
-
-export function createWorld(seed) {
+export function newRun(seed) {
   return {
     seed,
-    random: null,
-    state: null,
-    /** Fixed-step simulator. `fire` is a command object from the input layer or autopilot:
-     *  { moveX, moveY, aimX, aimY, shoot, dash }. Shot mode freezes audio involvement. */
-    step(dt, command, shotMode) {
-      const s = this.state;
-      s.time += dt;
-      s.secondsPerBeat = 60 / s.bpm;
-      const beatNow = Math.floor(s.time / s.secondsPerBeat);
-      if (beatNow > s.lastBeat) {
-        s.lastBeat = beatNow;
-        s.beatFlash = 1;
-        s.onBeatWindow = true;
-      } else {
-        s.onBeatWindow = false;
-      }
-      s.beatFlash = Math.max(0, s.beatFlash - dt * 4);
-
-      this.stepPlayer(dt, command, shotMode);
-      this.stepEnemies(dt);
-      this.stepBullets(dt);
-      this.stepEnemyBullets(dt);
-      this.stepParticles(dt);
-      this.stepDirector();
-      this.stepCombo(dt);
-
-      if (s.hp <= 0 && s.screen === SCREEN_PLAY) {
-        s.screen = SCREEN_OVER;
-        return EVENT_OVER;
-      }
-      return 0;
+    state: STATE.TITLE,
+    wave: 1,
+    score: 0,
+    best: Number(localStorage.getItem('pulsebloom.best') || 0),
+    combo: 0,
+    scoreMul: 1,
+    beatDashBonus: SCORING.onBeatDash,
+    beatFlash: 0,
+    time: 0,
+    waveTime: 0,
+    plan: wavePlan(1),
+    planIndex: 0,
+    player: {
+      x: ARENA_CENTER.x, y: ARENA_CENTER.y + 160,
+      vx: 0, vy: 0,
+      radius: PLAYER.radius,
+      health: PLAYER.maxHealth, maxHealth: PLAYER.maxHealth,
+      speed: PLAYER.speed, fireInterval: PLAYER.fireInterval,
+      bulletSpeed: PLAYER.bulletSpeed, pierce: 0, spread: 0,
+      dashTimer: 0, dashCooldown: 0, dashing: false,
+      fireTimer: 0, aim: -Math.PI / 2,
+      invuln: 0,
     },
-    stepPlayer(dt, command, shotMode) {
-      const s = this.state;
-      const p = s.player;
-      if (s.screen !== SCREEN_PLAY) return;
-      // Dash: a short burst with a cooldown; dashing exactly on the beat pays out.
-      if (command.dash && p.dashTimer <= 0 && p.dashCooldownTimer <= 0) {
-        const aimX = command.moveX || command.aimX || 0;
-        const aimY = command.moveY || command.aimY || 0;
-        const len = Math.hypot(aimX, aimY) || 1;
-        p.dashVX = (aimX / len) * PLAYER.dashSpeed;
-        p.dashVY = (aimY / len) * PLAYER.dashSpeed;
-        p.dashTimer = PLAYER.dashTime;
-        p.dashCooldownTimer = s.dashCooldown;
-        if (s.onBeatWindow && !shotMode) s.score += SCORE_PER_BEAT_DASH;
-        if (shotMode) s.score += SCORE_PER_BEAT_DASH;
-        for (let i = 0; i < 8; i += 1) this.spawnParticle(p.x, p.y, rangeBetween(s.random, -60, 60), rangeBetween(s.random, -60, 60), 0.3, PALETTE.player, 3);
-      }
-      if (p.dashTimer > 0) {
-        p.dashTimer -= dt;
-        p.x += p.dashVX * dt;
-        p.y += p.dashVY * dt;
-        p.invuln = Math.max(p.invuln, 0.12);
-      } else {
-        p.dashCooldownTimer -= dt;
-        p.x += command.moveX * s.playerSpeed * dt;
-        p.y += command.moveY * s.playerSpeed * dt;
-      }
-      p.x = Math.max(FIELD.margin, Math.min(FIELD.width - FIELD.margin, p.x));
-      p.y = Math.max(FIELD.margin, Math.min(FIELD.height - FIELD.margin, p.y));
-      p.invuln = Math.max(0, p.invuln - dt);
-
-      // Shooting: hold to fire toward the aim point, at a rate the upgrades shape.
-      p.fireTimer -= dt;
-      if (command.shoot && p.fireTimer <= 0) {
-        p.fireTimer = s.fireInterval;
-        const baseAngle = Math.atan2(command.aimY - p.y, command.aimX - p.x);
-        const spread = s.spread;
-        for (let i = 0; i <= spread; i += 1) {
-          const angle = baseAngle + (i - spread / 2) * 0.12;
-          s.bullets.push({
-            x: p.x + Math.cos(baseAngle) * PLAYER.radius,
-            y: p.y + Math.sin(baseAngle) * PLAYER.radius,
-            vx: Math.cos(angle) * PLAYER.bulletSpeed,
-            vy: Math.sin(angle) * PLAYER.bulletSpeed,
-            r: s.bulletRadius,
-            damage: s.bulletDamage,
-            pierce: s.pierce,
-            life: 1.4,
-          });
-        }
-        s.firedShots += 1;
-        if (!shotMode) s.onShoot?.();
-        for (let i = 0; i < 3; i += 1) this.spawnParticle(p.x + Math.cos(baseAngle) * 20, p.y + Math.sin(baseAngle) * 20, Math.cos(baseAngle) * 120 + rangeBetween(s.random, -40, 40), Math.sin(baseAngle) * 120 + rangeBetween(s.random, -40, 40), 0.15, PALETTE.bullet, 2);
-      }
-    },
-    stepEnemies(dt) {
-      const s = this.state;
-      const p = s.player;
-      for (const enemy of s.enemies) {
-        enemy.pulse = (s.time / s.secondsPerBeat) % 1;
-        if (enemy.type === 'dart') {
-          if (enemy.telegraph > 0) {
-            enemy.telegraph -= dt;
-          } else if (enemy.chargeDir === null) {
-            const angle = Math.atan2(p.y - enemy.y, p.x - enemy.x);
-            enemy.chargeDir = { x: Math.cos(angle), y: Math.sin(angle) };
-            enemy.charging = ENEMIES.dart.chargeTime;
-          } else if (enemy.charging > 0) {
-            enemy.charging -= dt;
-            enemy.x += enemy.chargeDir.x * ENEMIES.dart.chargeSpeed * dt;
-            enemy.y += enemy.chargeDir.y * ENEMIES.dart.chargeSpeed * dt;
-          } else {
-            // After the charge it drifts toward the player slowly.
-            const angle = Math.atan2(p.y - enemy.y, p.x - enemy.x);
-            enemy.x += Math.cos(angle) * ENEMIES.dart.speed * dt;
-            enemy.y += Math.sin(angle) * ENEMIES.dart.speed * dt;
-          }
-        } else if (enemy.type === 'boss') {
-          const angle = Math.atan2(FIELD.centreY - enemy.y, FIELD.centreX - enemy.x);
-          enemy.x += Math.cos(angle) * enemy.speed * dt;
-          enemy.y += Math.sin(angle) * enemy.speed * dt;
-          if (s.lastBeat !== enemy.lastBurst && s.lastBeat % ENEMIES.boss.burstBeatEvery === 0 && s.lastBeat > enemy.lastBurst) {
-            enemy.lastBurst = s.lastBeat;
-            for (let i = 0; i < ENEMIES.boss.burstShots; i += 1) {
-              const shotAngle = (i / ENEMIES.boss.burstShots) * Math.PI * 2 + s.time;
-              s.enemyBullets.push({ x: enemy.x, y: enemy.y, vx: Math.cos(shotAngle) * BULLET.enemySpeed, vy: Math.sin(shotAngle) * BULLET.enemySpeed, r: BULLET.enemyRadius, life: 6 });
-            }
-          }
-        } else {
-          const angle = Math.atan2(p.y - enemy.y, p.x - enemy.x);
-          enemy.x += Math.cos(angle) * enemy.speed * dt;
-          enemy.y += Math.sin(angle) * enemy.speed * dt;
-        }
-        // Touching anything hostile hurts.
-        if (p.invuln <= 0 && Math.hypot(enemy.x - p.x, enemy.y - p.y) < enemy.radius + PLAYER.radius) this.hurtPlayer();
-      }
-      // Nothing hostile wanders out of the arena for long: clamp strays back inside.
-      for (const enemy of s.enemies) {
-        if (enemy.y > FIELD.height + 60) enemy.y = FIELD.height + 60;
-        if (enemy.y < -80) enemy.y = -80;
-        if (enemy.x > FIELD.width + 60) enemy.x = FIELD.width + 60;
-        if (enemy.x < -80) enemy.x = -80;
-      }
-    },
-    stepBullets(dt) {
-      const s = this.state;
-      for (let i = s.bullets.length - 1; i >= 0; i -= 1) {
-        const bullet = s.bullets[i];
-        bullet.x += bullet.vx * dt;
-        bullet.y += bullet.vy * dt;
-        bullet.life -= dt;
-        if (bullet.life <= 0 || bullet.x < -30 || bullet.x > FIELD.width + 30 || bullet.y < -30 || bullet.y > FIELD.height + 30) {
-          s.bullets.splice(i, 1);
-          continue;
-        }
-        for (let j = s.enemies.length - 1; j >= 0; j -= 1) {
-          const enemy = s.enemies[j];
-          if (Math.hypot(enemy.x - bullet.x, enemy.y - bullet.y) < enemy.radius + bullet.r) {
-            enemy.hp -= bullet.damage;
-            if (s.knockback > 0) {
-              const angle = Math.atan2(enemy.y - bullet.y, enemy.x - bullet.x);
-              enemy.x += Math.cos(angle) * s.knockback * dt * 10;
-              enemy.y += Math.sin(angle) * s.knockback * dt * 10;
-            }
-            if (bullet.pierce > 0) bullet.pierce -= 1;
-            else s.bullets.splice(i, 1);
-            if (!s.shotMode) s.onHit?.();
-            if (enemy.hp <= 0) {
-              s.enemies.splice(j, 1);
-              this.killEnemy(enemy);
-            } else {
-              for (let k = 0; k < 4; k += 1) this.spawnParticle(bullet.x, bullet.y, rangeBetween(s.random, -140, 140), rangeBetween(s.random, -140, 140), 0.25, PALETTE.bullet, 3);
-            }
-            break;
-          }
-        }
-      }
-    },
-    killEnemy(enemy) {
-      const s = this.state;
-      s.combo += 1;
-      s.comboTimer = COMBO.decaySeconds;
-      s.score += Math.round(enemy.score * (1 + s.combo * 0.1) * s.scoreMult);
-      const colour = enemy.type === 'boss' ? PALETTE.enemyC : enemy.tint;
-      for (let i = 0; i < (enemy.type === 'boss' ? 60 : 16); i += 1) {
-        this.spawnParticle(enemy.x, enemy.y, rangeBetween(s.random, -260, 260), rangeBetween(s.random, -260, 260), rangeBetween(s.random, 0.3, 0.8), colour, enemy.type === 'boss' ? 5 : 3);
-      }
-      if (enemy.type === 'bloom') {
-        for (let i = 0; i < ENEMIES.bloom.shards; i += 1) {
-          s.enemies.push({
-            type: 'shard', x: enemy.x + rangeBetween(s.random, -20, 20), y: enemy.y + rangeBetween(s.random, -20, 20),
-            radius: ENEMIES.shard.radius, hp: ENEMIES.shard.hp, speed: ENEMIES.shard.speed, score: ENEMIES.shard.score,
-            tint: enemy.tint, pulse: 0, chargeDir: null, telegraph: 0, lastBurst: -1,
-          });
-        }
-      }
-      if (!s.shotMode) s.onKill?.();
-    },
-    stepEnemyBullets(dt) {
-      const s = this.state;
-      const p = s.player;
-      for (let i = s.enemyBullets.length - 1; i >= 0; i -= 1) {
-        const bullet = s.enemyBullets[i];
-        bullet.x += bullet.vx * dt;
-        bullet.y += bullet.vy * dt;
-        bullet.life -= dt;
-        if (bullet.life <= 0 || bullet.x < -40 || bullet.x > FIELD.width + 40 || bullet.y < -40 || bullet.y > FIELD.height + 40) {
-          s.enemyBullets.splice(i, 1);
-          continue;
-        }
-        if (p.invuln <= 0 && Math.hypot(bullet.x - p.x, bullet.y - p.y) < bullet.r + PLAYER.radius) {
-          s.enemyBullets.splice(i, 1);
-          this.hurtPlayer();
-        }
-      }
-    },
-    stepParticles(dt) {
-      const s = this.state;
-      for (let i = s.particles.length - 1; i >= 0; i -= 1) {
-        const particle = s.particles[i];
-        particle.x += particle.vx * dt;
-        particle.y += particle.vy * dt;
-        particle.vx *= 1 - dt * 3;
-        particle.vy *= 1 - dt * 3;
-        particle.life -= dt;
-        if (particle.life <= 0) s.particles.splice(i, 1);
-      }
-    },
-    stepCombo(dt) {
-      const s = this.state;
-      if (s.comboTimer > 0) {
-        s.comboTimer -= dt;
-        if (s.comboTimer <= 0) s.combo = 0;
-      }
-    },
-    stepDirector() {
-      const s = this.state;
-      if (s.screen !== SCREEN_PLAY) return;
-      // Spawning: entries come due on their planned beat.
-      while (s.plan.length > 0 && s.lastBeat >= s.plan[0].beat) {
-        const entry = s.plan.shift();
-        s.enemies.push({
-          type: entry.type, x: entry.x, y: entry.y,
-          radius: ENEMIES[entry.type].radius, hp: Math.ceil(ENEMIES[entry.type].hp * entry.scale),
-          speed: (ENEMIES[entry.type].speed ?? 0) * entry.scale || (ENEMIES[entry.type].chargeSpeed ?? 0),
-          score: ENEMIES[entry.type].score, tint: entry.type === 'drifter' ? PALETTE.enemyA : entry.type === 'dart' ? PALETTE.enemyB : PALETTE.enemyC,
-          pulse: 0, chargeDir: entry.type === 'dart' ? null : undefined,
-          telegraph: entry.type === 'dart' ? ENEMIES.dart.telegraph : 0,
-          lastBurst: -1,
-        });
-      }
-      if (s.plan.length === 0 && s.enemies.length === 0 && s.enemyBullets.length === 0) {
-        if (s.wave >= WAVES.total) {
-          s.screen = SCREEN_WIN;
-          s.wonAt = s.time;
-          return;
-        }
-        s.screen = SCREEN_UPGRADE;
-        s.offers = rollOffers(s.random, s.taken);
-      }
-    },
-    hurtPlayer() {
-      const s = this.state;
-      const p = s.player;
-      if (p.invuln > 0 || s.hp <= 0) return;
-      s.hp -= 1;
-      p.invuln = PLAYER.hurtInvuln;
-      s.combo = 0;
-      for (let i = 0; i < 24; i += 1) this.spawnParticle(p.x, p.y, rangeBetween(s.random, -300, 300), rangeBetween(s.random, -300, 300), 0.5, PALETTE.enemyBullet, 4);
-      if (!s.shotMode) s.onHurt?.();
-    },
-    spawnParticle(x, y, vx, vy, life, colour, size) {
-      const s = this.state;
-      if (s.particles.length > 400) s.particles.shift();
-      s.particles.push({ x, y, vx, vy, life, maxLife: life, colour, size });
-    },
-    chooseUpgrade(index) {
-      const s = this.state;
-      if (s.screen !== SCREEN_UPGRADE || index >= s.offers.length) return;
-      const upgrade = s.offers[index];
-      upgrade.apply(s);
-      s.taken.add(upgrade.id);
-      s.wave += 1;
-      s.bpm = WAVES.bpmStart + WAVES.bpmPerWave * s.wave;
-      s.onBpm?.(s.bpm);
-      s.plan = planWave(s.wave, s.random);
-      s.screen = SCREEN_PLAY;
-      if (!s.shotMode) s.onWaveStart?.();
-    },
-    reset() {
-      this.random = createRandom(this.seed);
-      this.state = {
-        random: this.random,
-        screen: SCREEN_TITLE,
-        time: 0,
-        lastBeat: -1,
-        beatFlash: 0,
-        onBeatWindow: false,
-        secondsPerBeat: 60 / WAVES.bpmStart,
-        bpm: WAVES.bpmStart,
-        wave: 0,
-        score: 0,
-        best: this.state ? this.state.best : 0,
-        hp: PLAYER.hp,
-        maxHp: PLAYER.hp,
-        combo: 0,
-        comboTimer: 0,
-        scoreMult: 1,
-        firedShots: 0,
-        player: { x: FIELD.centreX, y: FIELD.centreY, dashTimer: 0, dashCooldownTimer: 0, dashVX: 0, dashVY: 0, fireTimer: 0, invuln: 0 },
-        bullets: [],
-        enemies: [],
-        enemyBullets: [],
-        particles: [],
-        plan: planWave(0, this.random),
-        offers: [],
-        taken: new Set(),
-        // Tuning fields the upgrades rewrite.
-        bulletDamage: PLAYER.bulletDamage,
-        fireInterval: PLAYER.fireInterval,
-        playerSpeed: PLAYER.speed,
-        dashCooldown: PLAYER.dashCooldown,
-        spread: 0,
-        pierce: 0,
-        bulletRadius: PLAYER.bulletRadius,
-        knockback: 0,
-        shotMode: false,
-        onShoot: null, onHit: null, onKill: null, onHurt: null, onBpm: null, onWaveStart: null,
-      };
-    },
-    beginRun() {
-      this.state.screen = SCREEN_PLAY;
-      this.state.wave = 1;
-      this.state.plan = planWave(1, this.random);
-    },
+    enemies: [], bullets: [], enemyBullets: [], particles: [], floaters: [],
+    offers: [], taken: {},
+    message: '', messageTimer: 0,
+    stats: { kills: 0, dashes: 0, onBeatDashes: 0 },
   };
+}
+
+export function startRun(s) { s.state = STATE.PLAYING; s.waveTime = 0; s.message = 'Wave 1'; s.messageTimer = 2; }
+export const isBossWave = (s) => s.plan.isBoss;
+
+function spawnEnemy(s, spec) {
+  const e = enemySpec(spec.kind);
+  const a = s.random.angle();
+  s.enemies.push({
+    kind: spec.kind, spec: e, boss: spec.boss,
+    x: ARENA_CENTER.x + Math.cos(a) * ARENA_RADIUS,
+    y: ARENA_CENTER.y + Math.sin(a) * ARENA_RADIUS,
+    health: e.health, shotTimer: e.shotEvery || 0,
+    bloom: 0.8, // seconds of bloom-in before it acts
+    lungeTimer: e.lunge ? 1.5 : 0,
+  });
+}
+
+function addParticles(s, x, y, tint, n = 10) {
+  for (let i = 0; i < n; i++) {
+    const a = s.random.angle(), sp = s.random.range(40, 200);
+    s.particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: s.random.range(0.3, 0.7), tint });
+  }
+}
+
+function floatText(s, x, y, text, tint) {
+  s.floaters.push({ x, y, text, tint, life: 0.9 });
+}
+
+export function addScore(s, base) {
+  s.combo = Math.min(SCORING.comboCap, s.combo + 1);
+  const gain = Math.round(base * (1 + s.combo * SCORING.comboStep) * s.scoreMul);
+  s.score += gain;
+  return gain;
+}
+
+function hurtPlayer(s, audio) {
+  const p = s.player;
+  if (p.invuln > 0 || p.dashing) return;
+  p.health--;
+  p.invuln = 1.2;
+  s.combo = 0;
+  audio.hurt();
+  addParticles(s, p.x, p.y, '#ff6b6b', 16);
+  if (p.health <= 0) endRun(s, false);
+  else { s.message = 'Ouch!'; s.messageTimer = 1; }
+}
+
+function endRun(s, won) {
+  s.stats.won = won;
+  if (s.score > s.best) { s.best = s.score; localStorage.setItem('pulsebloom.best', String(s.best)); }
+  s.state = won ? STATE.VICTORY : STATE.GAME_OVER;
+}
+
+export function nextWave(s) {
+  s.wave++;
+  if (s.wave > 10) { endRun(s, true); return; }
+  s.plan = wavePlan(s.wave);
+  s.planIndex = 0;
+  s.waveTime = 0;
+  s.state = STATE.PLAYING;
+  s.message = s.plan.isBoss ? `Wave ${s.wave} — BOSS` : `Wave ${s.wave}`;
+  s.messageTimer = 2;
+}
+
+// One fixed 60 Hz step. audio and input come from main.js; only the player's
+// dash checks the beat, everything else is deterministic from state.
+export function step(s, dt, input, audio, onBeat) {
+  s.time += dt;
+  s.beatFlash = Math.max(0, s.beatFlash - dt * 3);
+  s.messageTimer = Math.max(0, s.messageTimer - dt);
+
+  const p = s.player;
+  p.invuln = Math.max(0, p.invuln - dt);
+  p.dashCooldown = Math.max(0, p.dashCooldown - dt);
+
+  // movement
+  let mx = 0, my = 0;
+  if (input.down('KeyW', 'ArrowUp')) my -= 1;
+  if (input.down('KeyS', 'ArrowDown')) my += 1;
+  if (input.down('KeyA', 'ArrowLeft')) mx -= 1;
+  if (input.down('KeyD', 'ArrowRight')) mx += 1;
+  const len = Math.hypot(mx, my) || 1;
+  p.aim = Math.atan2(input.mouse.y - p.y, input.mouse.x - p.x);
+
+  if (p.dashing) {
+    p.dashTimer -= dt;
+    if (p.dashTimer <= 0) p.dashing = false;
+  } else {
+    p.vx = (mx / len) * p.speed;
+    p.vy = (my / len) * p.speed;
+  }
+  if (input.pressed('Space') && p.dashCooldown <= 0 && !p.dashing) {
+    const a = (mx || my) ? Math.atan2(my, mx) : p.aim;
+    p.vx = Math.cos(a) * PLAYER.dashSpeed;
+    p.vy = Math.sin(a) * PLAYER.dashSpeed;
+    p.dashing = true;
+    p.dashTimer = PLAYER.dashSeconds;
+    p.dashCooldown = PLAYER.dashCooldown;
+    s.stats.dashes++;
+    if (onBeat) {
+      s.stats.onBeatDashes++;
+      const gain = addScore(s, s.beatDashBonus);
+      floatText(s, p.x, p.y - 30, `ON BEAT +${gain}`, '#ffd94a');
+      s.beatFlash = 1;
+    }
+    audio.dash();
+  }
+  p.x += p.vx * dt;
+  p.y += p.vy * dt;
+  // stay in the arena
+  const dx = p.x - ARENA_CENTER.x, dy = p.y - ARENA_CENTER.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist > ARENA_RADIUS - p.radius) {
+    p.x = ARENA_CENTER.x + (dx / dist) * (ARENA_RADIUS - p.radius);
+    p.y = ARENA_CENTER.y + (dy / dist) * (ARENA_RADIUS - p.radius);
+  }
+
+  // firing
+  p.fireTimer -= dt;
+  if (input.mouse.down && p.fireTimer <= 0) {
+    p.fireTimer = p.fireInterval;
+    const n = 1 + p.spread;
+    for (let i = 0; i < n; i++) {
+      const spread = n > 1 ? (i - (n - 1) / 2) * 0.12 : 0;
+      s.bullets.push({ x: p.x, y: p.y, vx: Math.cos(p.aim + spread) * p.bulletSpeed, vy: Math.sin(p.aim + spread) * p.bulletSpeed, pierce: p.pierce, hit: new Set() });
+    }
+    audio.shoot();
+  }
+
+  // bullets
+  for (const b of s.bullets) {
+    b.x += b.vx * dt; b.y += b.vy * dt;
+  }
+  s.bullets = s.bullets.filter((b) => Math.hypot(b.x - ARENA_CENTER.x, b.y - ARENA_CENTER.y) < ARENA_RADIUS + 60);
+
+  // spawns
+  s.waveTime += dt;
+  while (s.planIndex < s.plan.spawns.length && s.waveTime >= s.plan.spawns[s.planIndex].at) {
+    spawnEnemy(s, s.plan.spawns[s.planIndex]);
+    s.planIndex++;
+  }
+
+  // enemies
+  for (const e of s.enemies) {
+    if (e.bloom > 0) { e.bloom -= dt; continue; }
+    const ex = p.x - e.x, ey = p.y - e.y;
+    const ed = Math.hypot(ex, ey) || 1;
+    let sp = e.spec.speed * (1 + s.wave * 0.03);
+    if (e.spec.lunge) {
+      e.lungeTimer -= dt;
+      if (e.lungeTimer <= 0) { e.lungeTimer = 1.8; e.lungeVx = (ex / ed) * 340; e.lungeVy = (ey / ed) * 340; }
+      if (e.lungeVx !== undefined) { e.x += e.lungeVx * dt; e.y += e.lungeVy * dt; sp = 0; }
+    }
+    if (sp) { e.x += (ex / ed) * sp * dt; e.y += (ey / ed) * sp * dt; }
+    if (e.spec.shotEvery) {
+      e.shotTimer -= dt;
+      if (e.shotTimer <= 0) {
+        e.shotTimer = e.spec.shotEvery;
+        s.enemyBullets.push({ x: e.x, y: e.y, vx: (ex / ed) * e.spec.bulletSpeed, vy: (ey / ed) * e.spec.bulletSpeed });
+      }
+    }
+    if (ed < e.spec.radius + p.radius) hurtPlayer(s, audio);
+  }
+
+  // enemy bullets
+  for (const b of s.enemyBullets) {
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    if (Math.hypot(b.x - p.x, b.y - p.y) < p.radius + 5) { b.dead = true; hurtPlayer(s, audio); }
+  }
+  s.enemyBullets = s.enemyBullets.filter((b) => !b.dead && Math.hypot(b.x - ARENA_CENTER.x, b.y - ARENA_CENTER.y) < ARENA_RADIUS + 40);
+
+  // bullet hits
+  for (const b of s.bullets) {
+    for (const e of s.enemies) {
+      if (e.bloom > 0 || b.hit.has(e)) continue;
+      if (Math.hypot(b.x - e.x, b.y - e.y) < e.spec.radius + 4) {
+        e.health -= PLAYER.bulletDamage;
+        b.hit.add(e);
+        audio.hit();
+        addParticles(s, b.x, b.y, '#bff6ff', 4);
+        if (e.health <= 0) {
+          e.dead = true;
+          s.stats.kills++;
+          const gain = addScore(s, e.spec.score * SCORING.kill);
+          floatText(s, e.x, e.y, `+${gain}`, '#ffd94a');
+          addParticles(s, e.x, e.y, '#f4527f', 14);
+          audio.kill();
+        }
+        if (b.hit.size > b.pierce) b.dead = true;
+        break;
+      }
+    }
+  }
+  s.bullets = s.bullets.filter((b) => !b.dead);
+  s.enemies = s.enemies.filter((e) => !e.dead);
+
+  // particles and floaters
+  for (const pt of s.particles) { pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= dt; }
+  s.particles = s.particles.filter((pt) => pt.life > 0);
+  for (const f of s.floaters) { f.y -= 40 * dt; f.life -= dt; }
+  s.floaters = s.floaters.filter((f) => f.life > 0);
+
+  // wave cleared?
+  if (s.state === STATE.PLAYING && s.planIndex >= s.plan.spawns.length && !s.enemies.length) {
+    addScore(s, SCORING.waveClear);
+    audio.waveUp();
+    if (s.wave >= 10) { endRun(s, true); }
+    else {
+      s.state = STATE.UPGRADE;
+      s.offers = rollOffers(s.taken, s.random);
+    }
+  }
+}
+
+// The player picked a boon on the upgrade screen.
+export function chooseBoon(s, key, audio) {
+  const boon = boonByKey(key);
+  if (!boon || s.state !== STATE.UPGRADE) return;
+  boon.apply(s);
+  s.taken[key] = (s.taken[key] || 0) + 1;
+  audio.pickBoon();
+  s.message = boon.name;
+  s.messageTimer = 1.5;
+  nextWave(s);
+}
+
+// Deterministic helper for ?shot scenes: fast-forwards the sim without input.
+export function simulateSeconds(s, seconds, audio, onBeat) {
+  const dt = 1 / 60;
+  const idle = { down: () => false, pressed: () => false, mouse: { x: ARENA_CENTER.x, y: ARENA_CENTER.y - 120, down: true, clicked: false } };
+  for (let i = 0; i < seconds * 60; i++) step(s, dt, idle, audio, false);
 }
